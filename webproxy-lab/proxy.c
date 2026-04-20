@@ -37,13 +37,16 @@ static const char *user_agent_hdr =
  * - cache_lookup(...) / cache_insert(...)
  */
 
+ void *worker(void *arg);
+
 int main(int argc, char **argv)
 {
 
-  int listenfd, connfd;
+  int listenfd, connfd, connfd_cp;
   char hostname[MAXLINE], port[MAXLINE];
   socklen_t clientlen;
   struct sockaddr_storage clientaddr;
+  pthread_t tid;
 
   if (argc != 2) {
     fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -57,11 +60,26 @@ int main(int argc, char **argv)
     connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
     printf("Accepted connection from (%s, %s)\n", hostname, port);
-    doit(connfd);
-    Close(connfd);
-  }
+
+    int *connfd_cp = Malloc(sizeof(int));
+    *connfd_cp = connfd;
+    Pthread_create(&tid, NULL, worker, connfd_cp);
+    Pthread_detach(tid);
+    // doit(connfd);
+    // Close(connfd);
+  } 
   printf("%s", user_agent_hdr);
   return 0;
+}
+
+void *worker(void *arg) {
+  pthread_t tid;
+  int connfd = *((int *)arg);
+  Free(arg);
+
+  doit(connfd);
+  Close(connfd);
+  return NULL;
 }
 
 void doit(int fd) {
