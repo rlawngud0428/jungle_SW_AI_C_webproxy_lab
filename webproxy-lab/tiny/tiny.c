@@ -181,11 +181,19 @@ void serve_static(int fd, char *filename, int filesize) {
   printf("Response headers:\n");
   printf("%s", buf);
 
+  // srcfd = Open(filename, O_RDONLY, 0);
+  // srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
+  // Close(srcfd);
+  // Rio_writen(fd, srcp, filesize);
+  // Munmap(srcp, filesize);
+
   srcfd = Open(filename, O_RDONLY, 0);
-  srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
+  srcp = Malloc(filesize);
+  Rio_readn(srcfd, srcp, filesize);
   Close(srcfd);
+
   Rio_writen(fd, srcp, filesize);
-  Munmap(srcp, filesize);
+  Free(srcp);
 }
 
 void get_filetype(char *filename, char *filetype) {
