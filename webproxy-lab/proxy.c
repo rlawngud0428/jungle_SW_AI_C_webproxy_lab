@@ -1,9 +1,7 @@
 #include <stdio.h>
 #include "csapp.h"
 
-/* Recommended max cache and object sizes */
-#define MAX_CACHE_SIZE 1049000
-#define MAX_OBJECT_SIZE 102400
+#define MAX_HEADER_SIZE (8 * MAXLINE)
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr =
@@ -20,13 +18,12 @@ static const char *user_agent_hdr =
  *    - 서버로 보낼 새 HTTP/1.0 요청 만들기
  *    - origin server와 연결
  *    - 서버 응답을 클라이언트로 relay
- * 4. 여유가 있으면 cache를 붙인다.
  *
  * TODO: 시작 순서 추천
- * 1. cache/멀티스레드 없이 단일 연결 프록시를 먼저 완성한다.
+ * 1. 멀티스레드 없이 단일 연결 프록시를 먼저 완성한다.
  * 2. GET 요청만 처리되게 만든다.
  * 3. Host, User-Agent, Connection, Proxy-Connection 헤더를 올바르게 맞춘다.
- * 4. 응답 전달이 안정화되면 그 다음에 thread/cache를 추가한다.
+ * 4. 응답 전달이 안정화되면 그 다음에 thread를 추가한다.
  *
  * TODO: 구현하면서 helper 함수로 분리하면 좋은 후보
  * - parse_uri(...)
@@ -34,15 +31,21 @@ static const char *user_agent_hdr =
  * - build_http_header(...)
  * - doit(int connfd)
  * - forward_response(...)
- * - cache_lookup(...) / cache_insert(...)
  */
 
- void *worker(void *arg);
+int build_http_header(char *request, size_t request_size, char *path, char *host,
+                      char *host_hdr, char *other_hdrs, int has_host);
+int append_header(char *dst, size_t dst_size, size_t *used, char *src);
+void *worker(void *arg);
+void doit(int fd);
+int parse_uri(char *uri, char *host, char *port, char *path);
+int read_requesthdrs(rio_t *rp, char *host_hdr, size_t host_hdr_size,
+                     char *other_hdrs, size_t other_hdrs_size, int *has_host);
+void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 
 int main(int argc, char **argv)
 {
-
-  int listenfd, connfd, connfd_cp;
+  int listenfd, connfd;
   char hostname[MAXLINE], port[MAXLINE];
   socklen_t clientlen;
   struct sockaddr_storage clientaddr;
@@ -54,6 +57,7 @@ int main(int argc, char **argv)
   }
 
   listenfd = Open_listenfd(argv[1]);
+  Signal(SIGPIPE, SIG_IGN);
 
   while (1) {
     clientlen = sizeof(clientaddr);
@@ -67,13 +71,11 @@ int main(int argc, char **argv)
     Pthread_detach(tid);
     // doit(connfd);
     // Close(connfd);
-  } 
-  printf("%s", user_agent_hdr);
+  }
   return 0;
 }
 
 void *worker(void *arg) {
-  pthread_t tid;
   int connfd = *((int *)arg);
   Free(arg);
 
@@ -84,57 +86,140 @@ void *worker(void *arg) {
 
 void doit(int fd) {
   // 1. 요청 읽고, 파싱
-  struct stat sbuf;
   char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
   char host[MAXLINE], port[MAXLINE], path[MAXLINE];
-  char request[MAXLINE];
+  char request[MAX_HEADER_SIZE];
+  int parsed;
+  int request_error = 0;
+
   rio_t client_rio, server_rio;
   ssize_t n;
   int serverfd;
 
+  char host_hdr[MAX_HEADER_SIZE];
+  char other_hdrs[MAX_HEADER_SIZE];
+  int has_host = 0;
 
-  Rio_readinitb(&client_rio, fd);
-  if (!Rio_readlineb(&client_rio, buf, MAXLINE)) {
+  rio_readinitb(&client_rio, fd);
+  if (rio_readlineb(&client_rio, buf, MAXLINE) <= 0) {
     return;
   }
 
   printf("%s", buf);
   // 요청 라인에서 GET, /..., HTTP/1.0 을 빠르게 분리하기 위한 도구
-  sscanf(buf, "%s %s %s", method, uri, version);
+  parsed = sscanf(buf, "%s %s %s", method, uri, version);
+  if (parsed != 3) {
+    clienterror(fd, "Bad Request", "400", "Bad Request", "Tiny does not accept this request");
+    return;
+  }
 
   // 지금은 GET 만 요청을 받을 수 있음. -> 그 외의 method는 if문 안에 들어가서 실행 불가 판정
   if (strcasecmp(method, "GET")) {
     clienterror(fd, method, "501", "Not Implemented", "Tiny does not implement this method");
     return;
   }
-  parse_uri(uri, host, port, path);
+  if (parse_uri(uri, host, port, path) == -1) {
+    clienterror(fd, method, "501", "Not Implemented", "Tiny does not implement this method");
+    return;
+  }
 
-  read_requesthdrs(&client_rio);
+  if (read_requesthdrs(&client_rio, host_hdr, sizeof(host_hdr),
+                       other_hdrs, sizeof(other_hdrs), &has_host) < 0) {
+    return;
+  }
 
   // 2. 클라이언트가 되어서 서버 연결
   serverfd = Open_clientfd(host, port);
-  Rio_readinitb(&server_rio, serverfd);
+  if (serverfd < 0) {
+    clienterror(fd, method, "502", "Bad Gateway", "Tiny can't enter this Gateway");
+    return;
+  }
+  rio_readinitb(&server_rio, serverfd);
 
   // 3. 요청 전달
-snprintf(request, MAXLINE, "GET %s HTTP/1.0\r\n", path);
-  snprintf(request + strlen(request), MAXLINE - strlen(request), "Host: %s\r\n", host);
-  snprintf(request + strlen(request), MAXLINE - strlen(request), "%s", user_agent_hdr);
-  snprintf(request + strlen(request), MAXLINE - strlen(request), "Connection: close\r\n");
-  snprintf(request + strlen(request), MAXLINE - strlen(request), "Proxy-Connection: close\r\n");
-  snprintf(request + strlen(request), MAXLINE - strlen(request), "\r\n");
-  
-  Rio_writen(serverfd, request, strlen(request));
+  // snprintf(request, MAXLINE, "GET %s HTTP/1.0\r\n", path);
+  // snprintf(request + strlen(request), MAXLINE - strlen(request), "Host: %s\r\n", host);
+  // snprintf(request + strlen(request), MAXLINE - strlen(request), "%s", user_agent_hdr);
+  // snprintf(request + strlen(request), MAXLINE - strlen(request), "Connection: close\r\n");
+  // snprintf(request + strlen(request), MAXLINE - strlen(request), "Proxy-Connection: close\r\n");
+  // snprintf(request + strlen(request), MAXLINE - strlen(request), "\r\n");
+  request_error = build_http_header(request, sizeof(request), path, host,
+                                    host_hdr, other_hdrs, has_host);
+
+  if (request_error) {
+    Close(serverfd);
+    return;
+  }
+
+  printf("---- origin request ----\n%s\n", request);
+
+  if (rio_writen(serverfd, request, strlen(request)) != (ssize_t)strlen(request)) {
+    Close(serverfd);
+    return;
+  }
 
   // 4. 응답 전달
-  // 그럼 이게 while로 쓰는게 맞나? 맞긴 한데. 왜냐하면 답장이 돌아와야 하잖아. 그럼 조건이 뭐가되지? 답장이 없는 동안은 계속 해야하나?
-  while((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
-    Rio_writen(fd, buf, n);
-
+  while ((n = rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
+    if (rio_writen(fd, buf, n) != n) {
+      break;
+    }
   }
   Close(serverfd);
 }
 
+int build_http_header(char *request, size_t request_size, char *path, char *host,
+                      char *host_hdr, char *other_hdrs, int has_host) {
+  size_t used = 0;
+  int written;
 
+  written = snprintf(request, request_size, "GET %s HTTP/1.0\r\n", path);
+  if (written < 0 || (size_t)written >= request_size) {
+    return -1;
+  }
+  used = written;
+
+  if (has_host) {
+    if (append_header(request, request_size, &used, host_hdr) < 0) {
+      return -1;
+    }
+  } else {
+    written = snprintf(request + used, request_size - used, "Host: %s\r\n", host);
+    if (written < 0 || (size_t)written >= request_size - used) {
+      return -1;
+    }
+    used += written;
+  }
+
+  if (append_header(request, request_size, &used, (char *)user_agent_hdr) < 0) {
+    return -1;
+  }
+  if (append_header(request, request_size, &used, "Connection: close\r\n") < 0) {
+    return -1;
+  }
+  if (append_header(request, request_size, &used, "Proxy-Connection: close\r\n") < 0) {
+    return -1;
+  }
+  if (append_header(request, request_size, &used, other_hdrs) < 0) {
+    return -1;
+  }
+  if (append_header(request, request_size, &used, "\r\n") < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int append_header(char *dst, size_t dst_size, size_t *used, char *src) {
+  size_t len = strlen(src);
+
+  if (*used + len >= dst_size) {
+    return -1;
+  }
+  memcpy(dst + *used, src, len);
+  *used += len;
+  dst[*used] = '\0';
+  return 0;
+}
 
 int parse_uri(char *uri, char *host, char *port, char *path) {
   char *hostbegin;
@@ -207,43 +292,97 @@ int parse_uri(char *uri, char *host, char *port, char *path) {
   }
 
   /* 9. 정상적으로 파싱이 끝났으면 성공 값을 반환한다. */
-
   return 0;
 }
 
-void read_requesthdrs(rio_t *rp) {
+int read_requesthdrs(rio_t *rp, char *host_hdr, size_t host_hdr_size,
+                     char *other_hdrs, size_t other_hdrs_size, int *has_host) {
   char buf[MAXLINE];
+  ssize_t n;
+  size_t used;
+
+  host_hdr[0] = '\0';
+  other_hdrs[0] = '\0';
+  *has_host = 0;
 
   // rp -> rio_pointer 
   // rio_t -> 소켓이나 파일에서 안전하게 읽고 쓰기 위한 버퍼 구조체
-  Rio_readlineb(rp, buf, MAXLINE);
-  printf("%s", buf);
+  while ((n = rio_readlineb(rp, buf, MAXLINE)) > 0) {
+    // "\r\n"을 만날 때까지 계속 한 줄씩 읽는다.
+    if (!strcmp(buf, "\r\n")) {
+      break;
+    }
 
-  // "\r\n"을 만날 때까지 계속 한 줄씩 읽는다.
-  while (strcmp(buf, "\r\n")) {
-    Rio_readlineb(rp, buf, MAXLINE);
-    printf("%s", buf);
+    if (strncasecmp(buf, "Host:", 5) == 0) {
+      // host 처리
+      if (strlen(buf) >= host_hdr_size) {
+        return -1;
+      }
+      strcpy(host_hdr, buf);
+      *has_host = 1;
+    } else if (strncasecmp(buf, "Connection:", 11) == 0) {
+      // 무시
+    } else if (strncasecmp(buf, "Proxy-Connection:", 17) == 0) {
+      // 무시
+    } else if (strncasecmp(buf, "User-Agent:", 11) == 0) {
+      // 무시
+    } else {
+      // other_hdrs에 추가
+      used = strlen(other_hdrs);
+      if (append_header(other_hdrs, other_hdrs_size, &used, buf) < 0) {
+        return -1;
+      }
+    }
   }
-  return;
+
+  if (n < 0) {
+    return -1;
+  }
+  return 0;
 }
 
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg) {
   char buf[MAXLINE], body[MAXBUF];
+  size_t used = 0;
+  int written;
 
-  sprintf(body, "<html><title>Tiny Error</title>");
-  sprintf(body, "%s<body bgcolor="
-                "ffffff"
-                ">\r\n",
-          body);
-  sprintf(body, "%s%s: %s\r\n", body, errnum, shortmsg);
-  sprintf(body, "%s<p>%s: %s\r\n", body, longmsg, cause);
-  sprintf(body, "%s<hr><em>The Tiny Web server</em>\r\n", body);
+  written = snprintf(body + used, sizeof(body) - used, "<html><title>Tiny Error</title>");
+  if (written < 0 || (size_t)written >= sizeof(body) - used) {
+    return;
+  }
+  used += written;
+  written = snprintf(body + used, sizeof(body) - used, "<body bgcolor=ffffff>\r\n");
+  if (written < 0 || (size_t)written >= sizeof(body) - used) {
+    return;
+  }
+  used += written;
+  written = snprintf(body + used, sizeof(body) - used, "%s: %s\r\n", errnum, shortmsg);
+  if (written < 0 || (size_t)written >= sizeof(body) - used) {
+    return;
+  }
+  used += written;
+  written = snprintf(body + used, sizeof(body) - used, "<p>%s: %s\r\n", longmsg, cause);
+  if (written < 0 || (size_t)written >= sizeof(body) - used) {
+    return;
+  }
+  used += written;
+  written = snprintf(body + used, sizeof(body) - used, "<hr><em>The Tiny Web server</em>\r\n");
+  if (written < 0 || (size_t)written >= sizeof(body) - used) {
+    return;
+  }
+  used += written;
 
   sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
-  Rio_writen(fd, buf, strlen(buf));
+  if (rio_writen(fd, buf, strlen(buf)) < 0) {
+    return;
+  }
   sprintf(buf, "Content-type: text/html\r\n");
-  Rio_writen(fd, buf, strlen(buf));
+  if (rio_writen(fd, buf, strlen(buf)) < 0) {
+    return;
+  }
   sprintf(buf, "Content-length: %d\r\n\r\n", (int)strlen(body));
-  Rio_writen(fd, buf, strlen(buf));
-  Rio_writen(fd, body, strlen(body));
+  if (rio_writen(fd, buf, strlen(buf)) < 0) {
+    return;
+  }
+  rio_writen(fd, body, strlen(body));
 }
